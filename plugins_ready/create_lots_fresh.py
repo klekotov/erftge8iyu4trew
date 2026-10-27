@@ -36,6 +36,9 @@
     /fresh_bisect 402  → найти виноватое поле: берёт эталон, который уже срабатывал,
                          и добавляет поля вашего лота по одному, пока не сломается.
                          Тестовые лоты удаляются сразу после проверки.
+    /fresh_desc 402    → найти максимальную длину описания, которую принимает FunPay:
+                         наш текст обрезается до 200/400/600/800/1000/1200/1500 символов,
+                         плюс проверка «просто длинный текст без эмодзи».
     /fresh_list 402    → показать ВСЕ ваши лоты раздела (включая неактивные) с id и ценой.
     /fresh_activate 402→ включить (сделать активными) лоты, созданные неактивными.
     /fresh_find [слово]→ просканировать разделы (по умолчанию все, где встречается
@@ -51,6 +54,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from logging import getLogger
@@ -65,7 +69,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -1113,7 +1117,8 @@ def init_commands(cardinal: Cardinal):
                 results.append(f"❌ <b>{label}</b>\n     {message}")
                 if first_bad is None:
                     first_bad = label
-                    break  # дальше идти нет смысла: ломается уже это поле
+                    # не останавливаемся: остальные шаги (например, обрезка текста)
+                    # тоже полезны — по ним видно, где именно проходит.
 
         text = ("🔬 <b>Где ломается</b>\n\n" + "\n".join(results))
         if first_bad and first_bad.startswith("0"):
@@ -1123,6 +1128,115 @@ def init_commands(cardinal: Cardinal):
                      f"Пришлите этот экран, поправлю файл или плагин под это.")
         else:
             text += "\n\n🎉 Все варианты создались — пришлите экран, разберёмся, что поменялось."
+        for i in range(0, len(text), 3500):
+            bot.send_message(m.chat.id, text[i:i + 3500])
+
+    def fresh_desc(m: Message):
+        args = (m.text or "").split()
+        node_id = args[1].strip() if len(args) > 1 else "402"
+        if not node_id.isdigit():
+            bot.send_message(m.chat.id, "Использование: <code>/fresh_desc 402</code>")
+            return
+
+        # берем описание из файла, который прислал пользователь последним
+        source = "storage/cache/fresh_lots.json"
+        if not os.path.exists(source):
+            bot.send_message(m.chat.id, "Сначала пришлите JSON через <code>/fresh_lots</code> "
+                                        "(файл нужен как образец текста).")
+            return
+        try:
+            with open(source, "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+            lot = next((x for x in data if isinstance(x, dict)), None)
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось прочитать образец: <b>{e}</b>")
+            return
+        if not lot:
+            bot.send_message(m.chat.id, "❌ В образце нет лотов.")
+            return
+
+        try:
+            form = get_form(node_id)
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось получить форму раздела {node_id}: <b>{e}</b>")
+            return
+
+        desc_ru = str(lot.get("fields[desc][ru]", ""))
+        desc_en = str(lot.get("fields[desc][en]", ""))
+        title = str(lot.get("fields[summary][ru]", "тест"))
+
+        def cut(text: str, limit: int) -> str:
+            """Обрезает по границе строки, чтобы текст оставался читаемым."""
+            if len(text) <= limit:
+                return text
+            part = text[:limit]
+            if "\n" in part:
+                part = part[:part.rfind("\n")]
+            return part
+
+        cases: list[tuple[str, dict[str, str]]] = []
+        for limit in (200, 400, 600, 800, 1000, 1200, 1500):
+            v = dict(form.fields)
+            v.update({
+                "fields[name][ru]": "", "fields[name][en]": "",
+                "fields[summary][ru]": title, "fields[summary][en]": title,
+                "fields[desc][ru]": cut(desc_ru, limit),
+                "fields[desc][en]": cut(desc_en, limit),
+                "fields[payment_msg][ru]": cut(str(lot.get("fields[payment_msg][ru]", "")), 300),
+                "fields[payment_msg][en]": cut(str(lot.get("fields[payment_msg][en]", "")), 300),
+                "price": str(lot.get("price") or "49"), "amount": "1", "active": "",
+            })
+            for key in ("fields[game]", "fields[type]", "fields[method]"):
+                if lot.get(key):
+                    v[key] = str(lot[key])
+            cases.append((f"описание до {limit} символов", v))
+
+        # проверка «дело в длине или в содержимом»: тот же объём обычным текстом
+        filler = ("Проверка длины описания без эмодзи. " * 60)[:len(desc_ru)]
+        v = dict(form.fields)
+        v.update({
+            "fields[name][ru]": "", "fields[name][en]": "",
+            "fields[summary][ru]": title, "fields[summary][en]": title,
+            "fields[desc][ru]": filler, "fields[desc][en]": filler,
+            "fields[payment_msg][ru]": "тест", "fields[payment_msg][en]": "test",
+            "price": str(lot.get("price") or "49"), "amount": "1", "active": "",
+        })
+        for key in ("fields[game]", "fields[type]", "fields[method]"):
+            if lot.get(key):
+                v[key] = str(lot[key])
+        cases.append((f"текст без эмодзи, {len(filler)} символов", v))
+
+        bot.send_message(m.chat.id, f"📏 Проверяю {len(cases)} вариантов длины описания. "
+                                    f"Каждый тестовый лот удаляется сразу...")
+        results: list[str] = []
+        best = 0
+        for label, fields in cases:
+            fields = dict(fields)
+            fields["offer_id"] = "0"
+            before = lot_ids(cardinal, node_id)
+            time.sleep(1)
+            try:
+                ok, offer_id, message = save_and_verify(cardinal, node_id, fields, title,
+                                                        str(fields.get("price") or "49"), before)
+            except Exception as e:
+                ok, offer_id, message = False, None, str(e)
+            if ok:
+                results.append(f"✅ {label}")
+                if offer_id:
+                    delete_lot_raw(cardinal, form.fields, offer_id)
+                else:
+                    for new_id in sorted(lot_ids(cardinal, node_id) - before):
+                        delete_lot_raw(cardinal, form.fields, new_id)
+                if label.startswith("описание"):
+                    best = max(best, int(label.split()[-2]))
+            else:
+                results.append(f"❌ {label}\n     {message}")
+
+        text = ("📏 <b>Длина описания</b>\n\n" + "\n".join(results))
+        if best:
+            text += f"\n\n🎯 Максимальная рабочая длина: около <b>{best}</b> символов."
+        else:
+            text += "\n\n😕 Не прошёл даже 200-символьный вариант — причина не в длине."
         for i in range(0, len(text), 3500):
             bot.send_message(m.chat.id, text[i:i + 3500])
 
@@ -1267,6 +1381,7 @@ def init_commands(cardinal: Cardinal):
         ("fresh_cleanup", "удалить тестовые лоты после диагностики: /fresh_cleanup 402", True),
         ("fresh_list", "показать свои лоты раздела (включая неактивные): /fresh_list 402", True),
         ("fresh_bisect", "найти виноватое поле: /fresh_bisect 402", True),
+        ("fresh_desc", "найти максимальную длину описания: /fresh_desc 402", True),
         ("fresh_raw", "полный разбор ответа FunPay на создание лота: /fresh_raw 402", True),
         ("fresh_find", "найти, в каких разделах у вас вообще есть лоты: /fresh_find", True),
         ("fresh_activate", "включить неактивные лоты раздела: /fresh_activate 402", True),
@@ -1279,6 +1394,7 @@ def init_commands(cardinal: Cardinal):
     tg.msg_handler(fresh_list, commands=["fresh_list"])
     tg.msg_handler(act_bisect, commands=["fresh_bisect"])
     tg.file_handler(CBT_BISECT, bisect)
+    tg.msg_handler(fresh_desc, commands=["fresh_desc"])
     tg.msg_handler(fresh_raw, commands=["fresh_raw"])
     tg.msg_handler(fresh_find, commands=["fresh_find"])
     tg.msg_handler(fresh_activate, commands=["fresh_activate"])
