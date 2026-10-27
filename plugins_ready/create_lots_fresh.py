@@ -30,12 +30,17 @@
 Использование (всё из Telegram, консоль на хосте не нужна):
     /fresh_check 402   → какие поля есть в форме раздела, какие обязательные,
                          какие значения у списков. Ничего не создаёт.
+    /fresh_probe 402   → диагностика: создаёт по очереди несколько НЕАКТИВНЫХ лотов,
+                         каждый со своим набором полей, и показывает, какой вариант
+                         FunPay принимает. Нужен, когда непонятно, из-за какого поля
+                         приходит «Заполните все поля».
     /fresh_lots        → бот ждёт JSON-файл со лотами (формат как у /create_lots).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from logging import getLogger
 from typing import TYPE_CHECKING
@@ -49,7 +54,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -195,8 +200,9 @@ class OfferForm:
             value = "" if value is None else str(value)
             if key in SERVER_FIELDS:
                 continue
-            if key not in fields:
-                skipped.append(key)
+            if key == "fields[images]":
+                # Картинки грузятся отдельно и приходят в форме списком id — из JSON их не берём.
+                skipped.append(f"{key} (не переносим)")
                 continue
             if key in self.hidden:
                 # Скрытые поля (fields[name], fields[images] и т.п.) сайт отправляет ровно
@@ -214,6 +220,15 @@ class OfferForm:
             else:
                 fields[key] = value
             applied.append(key)
+
+        # В разделах вида 402 игра выбирается из списка (fields[game]), а fields[name][ru]/[en] —
+        # это «своя игра», которую пишут руками. Когда игра выбрана из списка, эти поля должны
+        # остаться пустыми (так в ручном лоте из /cache_lots).
+        if "fields[game]" in self.options and str(fields.get("fields[game]", "")).strip():
+            for name in ("fields[name][ru]", "fields[name][en]"):
+                if name in fields and str(fields.get(name, "")).strip():
+                    fields[name] = ""
+                    skipped.append(f"{name} (очищено: игра выбрана из списка)")
 
         # Активность: включённый по умолчанию чекбокс не должен «теряться»,
         # если в JSON его вовсе не было.
@@ -284,6 +299,101 @@ def download_file(tg, msg: Message, file_name: str = "fresh_lots.json") -> bool:
     return True
 
 
+
+PROBE_TEXT = {
+    "summary_ru": "🟪🟣Volkswagen Golf GTI Racer Edition💜🟣1,033 RAP💜🟪БЫСТРО",
+    "summary_en": "🟪🟣Volkswagen Golf TDI Racer Edition💜🟣1,033 RAP💜🟪FAST",
+    "desc_ru": ("🚗 Машина: Volkswagen Golf GTI Racer Edition\n"
+                "💰 Валюта: 1,033 RAP\n\n"
+                "🚧 ВАЖНО: для трейда нужен автосалон, прокачанный на 100%.\n"
+                "Напишите мне ДО покупки — подскажу, как это сделать.\n\n"
+                "⏱ Доставка 5–15 минут. 🎁 Скидка 10% за отзыв."),
+    "desc_en": ("🚗 Car: Volkswagen Golf TDI Racer Edition\n"
+                "💰 Amount: 1,033 RAP\n\n"
+                "🚧 IMPORTANT: trading requires a 100% completed car dealership.\n"
+                "Message me BEFORE buying and I will explain how to do it.\n\n"
+                "⏱ Delivery 5–15 minutes. 🎁 10% discount for a review."),
+    "payment_ru": ("Спасибо за покупку! 🚧 Напоминаю: для трейда нужен автосалон на 100%.\n"
+                   "Напишите ваш ник и название машины — выдам в течение 5–15 минут."),
+    "payment_en": ("Thank you for your purchase! 🚧 Reminder: trading requires a 100% car dealership.\n"
+                   "Send me your nickname and the car name — delivery in 5–15 minutes."),
+}
+
+PROBE_FILLER = "sdf43w0irt430pitrp943utiou33wuer4thw4twr"
+
+
+def probe_variants() -> list[tuple[str, dict[str, str]]]:
+    """
+    Набор вариантов для диагностики: каждый — набор значений поверх формы раздела.
+
+    Первые два варианта повторяют вручную созданный лот из /cache_lots (он точно
+    проходил валидацию FunPay), дальше по одному меняется подозрительное поле.
+
+    :return: список пар (описание варианта, значения полей).
+    """
+    t = PROBE_TEXT
+    his = {  # точная копия вручную созданного лота раздела 402
+        "fields[name][ru]": "", "fields[name][en]": "",
+        "fields[summary][ru]": PROBE_FILLER, "fields[summary][en]": PROBE_FILLER,
+        "fields[desc][ru]": PROBE_FILLER, "fields[desc][en]": PROBE_FILLER,
+        "fields[payment_msg][ru]": PROBE_FILLER, "fields[payment_msg][en]": PROBE_FILLER,
+        "price": "49", "amount": "1", "active": "",
+        "fields[game]": "Car Dealership Tycoon", "fields[type]": "Предметы",
+        "fields[method]": "Трейд",
+    }
+    ours = {
+        "fields[name][ru]": "", "fields[name][en]": "",
+        "fields[summary][ru]": t["summary_ru"], "fields[summary][en]": t["summary_en"],
+        "fields[desc][ru]": t["desc_ru"], "fields[desc][en]": t["desc_en"],
+        "fields[payment_msg][ru]": t["payment_ru"], "fields[payment_msg][en]": t["payment_en"],
+        "price": "49", "amount": "1", "active": "",
+        "fields[game]": "Car Dealership Tycoon", "fields[type]": "Предметы",
+        "fields[method]": "Трейд",
+    }
+
+    variants = [
+        ("1. как ваш ручной лот: заполнители, без названия, + method", dict(his)),
+        ("2. наши тексты, название игры пустое, + method", dict(ours)),
+    ]
+
+    v = dict(ours); v["fields[name][ru]"] = v["fields[name][en]"] = "Volkswagen Golf GTI Racer Edition"
+    variants.append(("3. наши тексты + название машины в «Название игры»", v))
+
+    v = dict(ours)
+    v["fields[desc][ru]"] = v["fields[desc][en]"] = "тест"
+    v["fields[payment_msg][ru]"] = v["fields[payment_msg][en]"] = ""
+    variants.append(("4. наши тексты, описание в одну строку", v))
+
+    v = dict(ours)
+    v["fields[summary][ru]"] = "Volkswagen Golf GTI Racer Edition 1033 RAP БЫСТРО"
+    v["fields[summary][en]"] = "Volkswagen Golf TDI Racer Edition 1033 RAP FAST"
+    variants.append(("5. наши тексты, заголовок без эмодзи", v))
+
+    v = dict(ours); v.pop("fields[method]", None)
+    variants.append(("6. наши тексты, БЕЗ fields[method]", v))
+
+    v = dict(ours); v["fields[type]"] = "Игровая валюта"
+    variants.append(("7. наши тексты, тип «Игровая валюта»", v))
+
+    v = dict(ours); v["fields[game]"] = ""; v["fields[name][ru]"] = v["fields[name][en]"] = "Car Dealership Tycoon"
+    variants.append(("8. игра не выбрана, название игры = Car Dealership Tycoon", v))
+
+    return variants
+
+
+def extract_offer_id(payload: dict) -> int | None:
+    """Пытается достать id созданного лота из ответа FunPay."""
+    for key in ("id", "offer_id", "offerId", "lotId", "lot_id"):
+        value = str(payload.get(key, ""))
+        if value.isdigit() and value != "0":
+            return int(value)
+    url = str(payload.get("url") or payload.get("redirect") or "")
+    match = re.search(r"[?&]id=(\d+)", url)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def init_commands(cardinal: Cardinal):
     if not cardinal.telegram:
         return
@@ -311,6 +421,62 @@ def init_commands(cardinal: Cardinal):
 
         text = (f"Форма раздела <a href=\"https://funpay.com/lots/{node_id}/trade\">{node_id}</a>\n\n"
                 + "\n".join(form.describe()))
+        for i in range(0, len(text), 3500):
+            bot.send_message(m.chat.id, text[i:i + 3500])
+
+
+    def fresh_probe(m: Message):
+        args = (m.text or "").split()
+        node_id = args[1].strip() if len(args) > 1 else "402"
+        if not node_id.isdigit():
+            bot.send_message(m.chat.id, "Использование: <code>/fresh_probe 402</code>")
+            return
+        try:
+            form = get_form(node_id)
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось получить форму раздела {node_id}: <b>{e}</b>")
+            return
+
+        variants = probe_variants()
+        bot.send_message(m.chat.id,
+                         f"🔬 Диагностика раздела {node_id}: {len(variants)} вариантов по 1 лоту, "
+                         f"все <b>неактивные</b> и с ценой 49 ₽.\n"
+                         f"Занимает ~{len(variants) + 2} секунд.")
+
+        results: list[str] = []
+        winner: str | None = None
+        for label, values in variants:
+            fields = dict(form.fields)
+            fields.update(values)
+            fields["offer_id"] = "0"
+            if "amount" not in values:
+                fields["amount"] = "1"
+            try:
+                time.sleep(1)
+                payload = save_offer(cardinal, fields)
+                offer_id = extract_offer_id(payload)
+                results.append(f"✅ <b>{label}</b> — создан")
+                winner = winner or label
+                logger.info(f"[FRESH PROBE] Вариант прошёл: {label} (id={offer_id})")
+                if offer_id:
+                    try:
+                        delete_fields = dict(form.fields)
+                        delete_fields.update({"offer_id": str(offer_id), "deleted": "1"})
+                        cardinal.account.method("post", "lots/offerSave", SAVE_HEADERS,
+                                                delete_fields, raise_not_200=True)
+                        results.append("     ↳ тестовый лот сразу удалён")
+                    except Exception:
+                        results.append("     ↳ создан, удалить автоматически не смог — удалите вручную")
+            except Exception as e:
+                results.append(f"❌ <b>{label}</b>\n     FunPay: {e}")
+                logger.warning(f"[FRESH PROBE] Вариант не прошёл: {label} ({e})")
+
+        text = "🔬 <b>Результат диагностики</b>\n\n" + "\n\n".join(results)
+        if winner:
+            text += f"\n\n🎯 Рабочий вариант: <b>{winner}</b>. Пришлите этот текст мне — поправлю плагин."
+        else:
+            text += ("\n\n😕 Ни один вариант не прошёл — дело не в значениях полей, "
+                     "а в самом запросе. Пришлите скриншот.")
         for i in range(0, len(text), 3500):
             bot.send_message(m.chat.id, text[i:i + 3500])
 
@@ -406,10 +572,12 @@ def init_commands(cardinal: Cardinal):
     cardinal.add_telegram_commands(UUID, [
         ("fresh_lots", "создает лоты по свежей форме раздела (обходит «Заполните все поля»)", True),
         ("fresh_check", "показать поля и допустимые значения раздела: /fresh_check 402", True),
+        ("fresh_probe", "диагностика раздела перебором вариантов: /fresh_probe 402", True),
     ])
 
     tg.msg_handler(act_create_lots, commands=["fresh_lots"])
     tg.msg_handler(fresh_check, commands=["fresh_check"])
+    tg.msg_handler(fresh_probe, commands=["fresh_probe"])
     tg.file_handler(CBT_WAIT_FILE, create_lots)
 
 
