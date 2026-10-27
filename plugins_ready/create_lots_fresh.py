@@ -69,7 +69,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -376,6 +376,43 @@ def save_and_verify(cardinal: Cardinal, node_id: str, fields: dict[str, str],
                          f"{response.url}). Текст со страницы: {response_text(response)}")
 
 
+def cut_text(text: str, limit: int) -> str:
+    """
+    Обрезает текст по границе строки, чтобы он остался читаемым.
+
+    :param text: исходный текст.
+    :param limit: максимум символов.
+
+    :return: обрезанный текст.
+    """
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    part = text[:limit]
+    # по возможности режем по границе строки, но не в ущерб объёму:
+    # если до границы осталось меньше 60% лимита — режем жёстко по символу.
+    if "\n" in part:
+        candidate = part[:part.rfind("\n")]
+        if len(candidate) >= limit * 0.6:
+            return candidate.rstrip()
+    return part.rstrip()
+
+
+def section_kind(cardinal: Cardinal, node_id: str) -> str:
+    """
+    Определяет тип раздела: COMMON (обычные лоты) или CURRENCY (игровая валюта).
+
+    :return: "COMMON", "CURRENCY" или "" если не удалось определить.
+    """
+    try:
+        for sub in cardinal.account.subcategories:
+            if str(sub.id_) == str(node_id):
+                return getattr(sub.type_, "name", "COMMON")
+    except Exception:
+        logger.debug("[FRESH LOTS] Не удалось определить тип раздела.", exc_info=True)
+    return ""
+
+
 def create_lot_with_fallback(cardinal: Cardinal, node_id: str, fields: dict[str, str],
                               title: str, price: str) -> tuple[bool, int | None, str, bool, list[str]]:
     """
@@ -395,15 +432,32 @@ def create_lot_with_fallback(cardinal: Cardinal, node_id: str, fields: dict[str,
     attempts: list[str] = []
     variants: list[tuple[str, dict[str, str], bool]] = [("как в файле", dict(fields), False)]
 
-    if str(fields.get("active", "")).strip():
-        v = dict(fields); v["active"] = ""
-        variants.append(("без активации", v, True))
+    base = dict(fields)
+    base["active"] = ""
 
-    v = dict(fields); v["active"] = ""
+    if str(fields.get("active", "")).strip():
+        variants.append(("без активации", dict(base), True))
+
+    no_name = dict(base)
     for name in ("fields[name][ru]", "fields[name][en]"):
-        if name in v:
-            v[name] = ""
-    variants.append(("без активации и без «Название игры»", v, True))
+        if name in no_name:
+            no_name[name] = ""
+    variants.append(("без активации и без «Название игры»", dict(no_name), True))
+
+    # У каждого раздела свои пределы длины текстов, и FunPay на превышение отвечает
+    # той же фразой «Заполните все поля.». Поэтому пробуем более короткие описания.
+    longest = max((len(str(no_name.get(k, ""))) for k in
+                   ("fields[desc][ru]", "fields[desc][en]",
+                    "fields[payment_msg][ru]", "fields[payment_msg][en]")), default=0)
+    for limit in (500, 350, 250, 150):
+        if longest <= limit:
+            continue
+        v = dict(no_name)
+        for key in ("fields[desc][ru]", "fields[desc][en]",
+                    "fields[payment_msg][ru]", "fields[payment_msg][en]"):
+            if key in v:
+                v[key] = cut_text(v[key], limit)
+        variants.append((f"без активации, тексты до {limit} символов", v, True))
 
     last_message = ""
     for label, variant_fields, is_inactive in variants:
@@ -1286,6 +1340,7 @@ def init_commands(cardinal: Cardinal):
                                         f"Создаю по свежей форме раздела (1 лот/сек)...")
 
             forms: dict[str, OfferForm] = {}
+            kinds: dict[str, str] = {}
 
             for index, lot in enumerate(data, start=1):
                 if not isinstance(lot, dict):
@@ -1303,6 +1358,14 @@ def init_commands(cardinal: Cardinal):
 
                 try:
                     time.sleep(1)
+                    if node_id not in kinds:
+                        kinds[node_id] = section_kind(cardinal, node_id)
+                    if kinds[node_id] == "CURRENCY":
+                        raise RuntimeError(
+                            "это раздел с лотами игровой валюты — у него другая форма (chips), "
+                            "и плагин такие лоты пока не создаёт. Нужен обычный раздел с лотами "
+                            "(в ссылке это <code>/lots/&lt;id&gt;/trade</code> без «валюты»)."
+                        )
                     if node_id not in forms:
                         forms[node_id] = get_form(node_id)
 
