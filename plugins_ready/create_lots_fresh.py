@@ -34,6 +34,8 @@
                          HTTP-код, адрес, куда перенаправил, JSON или страница,
                          текст, найденные id лотов, что было и что стало в разделе.
     /fresh_list 402    → показать ВСЕ ваши лоты раздела (включая неактивные) с id и ценой.
+    /fresh_find [слово]→ просканировать разделы (по умолчанию все, где встречается
+                         «roblox» или «dealership») и показать, где у вас вообще есть лоты.
     /fresh_cleanup 402 → удалить тестовые лоты, оставшиеся после /fresh_probe.
     /fresh_probe 402   → диагностика: создаёт по очереди несколько НЕАКТИВНЫХ лотов,
                          каждый со своим набором полей, и показывает, какой вариант
@@ -59,7 +61,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -769,6 +771,75 @@ def init_commands(cardinal: Cardinal):
         for i in range(0, len(text), 3500):
             bot.send_message(m.chat.id, text[i:i + 3500])
 
+    def fresh_find(m: Message):
+        args = (m.text or "").split()
+        word = args[1].strip().casefold() if len(args) > 1 else ""
+        keywords = [word] if word else ["roblox", "dealership", "tycoon"]
+
+        try:
+            subcategories = cardinal.account.subcategories
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось получить список разделов: <b>{e}</b>")
+            return
+
+        targets = []
+        for sub in subcategories:
+            # Только обычные лоты (не лоты игровой валюты).
+            if getattr(sub.type_, "name", "") != "COMMON":
+                continue
+            category = getattr(sub, "category", None)
+            haystack = f"{sub.name} {getattr(category, 'name', '')}".casefold()
+            if any(k in haystack for k in keywords):
+                targets.append(sub)
+
+        # раздел из команды (/fresh_find 402) — всегда в списке
+        for arg in args[1:]:
+            if arg.isdigit():
+                for sub in subcategories:
+                    if int(sub.id_) == int(arg) and sub not in targets:
+                        targets.append(sub)
+                        keywords = []
+
+        if not targets:
+            bot.send_message(m.chat.id, "😕 Подходящих разделов не нашлось. "
+                                        "Укажите слово или id: <code>/fresh_find 402</code>")
+            return
+
+        bot.send_message(m.chat.id,
+                         f"🔎 Проверяю ваши лоты в {len(targets)} разделах "
+                         f"(по слову: {', '.join(keywords) or 'id из команды'}).\n"
+                         f"Это займёт ~{int(len(targets) * 0.7) + 2} секунд...")
+
+        found_lines: list[str] = []
+        checked = 0
+        for sub in targets:
+            checked += 1
+            try:
+                time.sleep(0.4)
+                lots = cardinal.account.get_my_subcategory_lots(int(sub.id_))
+            except Exception:
+                logger.debug(f"[FRESH FIND] Не удалось получить лоты раздела {sub.id_}.", exc_info=True)
+                continue
+            if not lots:
+                continue
+            found_lines.append(f"\n📦 <b>{sub.name}</b> "
+                               f"(<a href=\"https://funpay.com/lots/{sub.id_}/trade\">{sub.id_}</a>) — "
+                               f"{len(lots)} лот(-ов)")
+            for lot in lots[:25]:
+                mark = "🟢" if lot.active else "⚪"
+                found_lines.append(f"  {mark} id <code>{lot.id}</code> · {lot.price:g} ₽ · "
+                                   f"{(lot.description or '')[:60]}")
+
+        if not found_lines:
+            bot.send_message(m.chat.id,
+                             f"Проверил {checked} разделов — <b>лотов нет ни в одном</b>.\n"
+                             f"Значит /fresh_probe действительно ничего не создал.")
+            return
+
+        text = (f"🔎 Проверено разделов: {checked}.\nНайдены ваши лоты:" + "\n".join(found_lines))
+        for i in range(0, len(text), 3500):
+            bot.send_message(m.chat.id, text[i:i + 3500])
+
     def act_create_lots(m: Message):
         global RUNNING
         if RUNNING:
@@ -876,6 +947,7 @@ def init_commands(cardinal: Cardinal):
         ("fresh_cleanup", "удалить тестовые лоты после диагностики: /fresh_cleanup 402", True),
         ("fresh_list", "показать свои лоты раздела (включая неактивные): /fresh_list 402", True),
         ("fresh_raw", "полный разбор ответа FunPay на создание лота: /fresh_raw 402", True),
+        ("fresh_find", "найти, в каких разделах у вас вообще есть лоты: /fresh_find", True),
     ])
 
     tg.msg_handler(act_create_lots, commands=["fresh_lots"])
@@ -884,6 +956,7 @@ def init_commands(cardinal: Cardinal):
     tg.msg_handler(fresh_cleanup, commands=["fresh_cleanup"])
     tg.msg_handler(fresh_list, commands=["fresh_list"])
     tg.msg_handler(fresh_raw, commands=["fresh_raw"])
+    tg.msg_handler(fresh_find, commands=["fresh_find"])
     tg.file_handler(CBT_WAIT_FILE, create_lots)
 
 
