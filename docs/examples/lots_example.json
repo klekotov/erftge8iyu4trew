@@ -1,0 +1,35 @@
+[
+    {
+        "node_id": "1089",
+        "active": "on",
+        "price": "199",
+        "amount": "9999",
+        "deactivate_after_sale": "",
+        "fields[summary][ru]": "💎 АВТОВЫДАЧА 💎 Гайд по привязке Battle.net",
+        "fields[summary][en]": "💎 AUTO-DELIVERY 💎 Battle.net linking guide",
+        "fields[desc][ru]": "После оплаты вы получаете:\nтекстовый файл \"Гайд по привязке учетной записи Battle.net\"",
+        "fields[desc][en]": "After payment you receive:\ntext file \"Guide for linking a Battle.net account\"",
+        "fields[payment_msg][ru]": "Спасибо за покупку! Товар отправлен сообщением ниже.",
+        "fields[payment_msg][en]": "Thank you for your purchase! The product is sent below.",
+        "fields[images]": "",
+        "secrets": "",
+        "form_created_at": "1716550274"
+    },
+    {
+        "node_id": "1089",
+        "active": "on",
+        "price": "250.50",
+        "amount": "",
+        "deactivate_after_sale": "",
+        "auto_delivery": "on",
+        "secrets": "example-code-1\nexample-code-2",
+        "fields[summary][ru]": "💎 АВТОВЫДАЧА 💎 Ключ активации",
+        "fields[summary][en]": "💎 AUTO-DELIVERY 💎 Activation key",
+        "fields[desc][ru]": "Ключ выдается автоматически сразу после оплаты.",
+        "fields[desc][en]": "The key is issued automatically right after payment.",
+        "fields[payment_msg][ru]": "Спасибо за покупку! Ключ отправлен ниже.",
+        "fields[payment_msg][en]": "Thank you for your purchase! The key is sent below.",
+        "fields[images]": "",
+        "form_created_at": "1716550274"
+    }
+]
