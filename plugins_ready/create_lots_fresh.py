@@ -56,7 +56,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -252,37 +252,114 @@ def describe_form(html: str) -> list[str]:
     return OfferForm(html).describe()
 
 
-def save_offer(cardinal: Cardinal, fields: dict[str, str]) -> dict:
+def response_text(response) -> str:
     """
-    Отправляет форму на FunPay без пересборки полей (как это делает сайт).
+    Возвращает читаемый текст ответа FunPay (без HTML-разметки).
 
-    :param cardinal: объект кардинала.
-    :param fields: поля формы.
-
-    :return: распарсенный JSON-ответ FunPay.
-
-    :raises RuntimeError: если FunPay вернул ошибку сохранения.
+    :param response: объект ответа requests.
     """
-    fields = dict(fields)
-    fields["offer_id"] = "0"
-
-    response = cardinal.account.method("post", "lots/offerSave", SAVE_HEADERS, fields, raise_not_200=True)
-
+    body = response.text or ""
     try:
-        payload = response.json()
+        text = BeautifulSoup(body, "lxml").get_text(" ", strip=True)
     except Exception:
-        payload = {}
+        text = body
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:400]
 
-    error = payload.get("error")
+
+def parse_error(payload: dict) -> str | None:
+    """
+    Достает текст ошибки из JSON-ответа FunPay.
+
+    :param payload: JSON-ответ.
+
+    :return: текст ошибки или None.
+    """
+    error = payload.get("error") or payload.get("msg")
     if not error and payload.get("errors"):
         errors = payload["errors"]
         if isinstance(errors, list):
             error = "; ".join(f"{name}: {text}" for name, text in errors)
         else:
             error = str(errors)
+    return str(error) if error else None
+
+
+def save_offer(cardinal: Cardinal, fields: dict[str, str]) -> tuple[dict, object, bool]:
+    """
+    Отправляет форму на FunPay без пересборки полей (как это делает сайт).
+
+    :param cardinal: объект кардинала.
+    :param fields: поля формы.
+
+    :return: (JSON-ответ или {}, объект ответа, был ли ответ JSON).
+
+    :raises RuntimeError: если FunPay вернул ошибку.
+    """
+    fields = dict(fields)
+    fields["offer_id"] = "0"
+
+    response = cardinal.account.method("post", "lots/offerSave", SAVE_HEADERS, fields, raise_not_200=True)
+
+    is_json = True
+    try:
+        payload = response.json()
+        if not isinstance(payload, dict):
+            payload, is_json = {}, False
+    except Exception:
+        payload, is_json = {}, False
+
+    error = parse_error(payload)
     if error:
         raise RuntimeError(error)
-    return payload
+    return payload, response, is_json
+
+
+def lot_ids(cardinal: Cardinal, node_id: str) -> set[int]:
+    """Возвращает id своих лотов раздела (для проверки «до/после»)."""
+    try:
+        return {int(lot.id) for lot in my_lots(cardinal, node_id)}
+    except Exception:
+        return set()
+
+
+def save_and_verify(cardinal: Cardinal, node_id: str, fields: dict[str, str],
+                    title: str, price: str, before_ids: set[int] | None = None) -> tuple[bool, int | None, str]:
+    """
+    Сохраняет лот и проверяет по списку лотов раздела, что он действительно создан.
+
+    :param cardinal: объект кардинала.
+    :param node_id: id раздела.
+    :param fields: поля формы.
+    :param title: ожидаемый заголовок лота.
+    :param price: ожидаемая цена.
+    :param before_ids: id лотов, существовавших до создания.
+
+    :return: (создан ли лот, id лота, сообщение об ошибке).
+    """
+    payload, response, is_json = save_offer(cardinal, fields)
+
+    offer_id = extract_offer_id(payload) if payload else None
+    if offer_id:
+        return True, offer_id, ""
+
+    # FunPay может ответить пустым JSON или HTML — тогда доверять нечему,
+    # проверяем по факту: появился ли лот в разделе.
+    try:
+        found = lot_is_visible(my_lots(cardinal, node_id), title, price, before_ids)
+    except Exception as e:
+        if payload:
+            return True, None, f"создан, но проверить не удалось ({e})"
+        return False, None, f"ответ FunPay: {response_text(response)}"
+
+    if found:
+        return True, found, ""
+
+    if is_json:
+        return False, None, (f"FunPay вернул пустой ответ (HTTP {response.status_code}, "
+                             f"{str(payload) or '{}'}) и лот в разделе не появился")
+    return False, None, (f"FunPay вернул не JSON, а страницу (HTTP {response.status_code}, "
+                         f"{response.url}). Текст со страницы: {response_text(response)}")
 
 
 def download_file(tg, msg: Message, file_name: str = "fresh_lots.json") -> bool:
@@ -423,13 +500,14 @@ def my_lots(cardinal: Cardinal, node_id: str):
         raise RuntimeError(f"не удалось получить список лотов раздела {node_id}: {e}") from e
 
 
-def lot_is_visible(lots, title: str, price: str) -> int | None:
+def lot_is_visible(lots, title: str, price: str, exclude: set[int] | None = None) -> int | None:
     """
     Ищет созданный лот в списке своих лотов раздела.
 
     :param lots: список лотов раздела.
     :param title: заголовок лота.
     :param price: цена лота (строкой).
+    :param exclude: id лотов, которые уже были до создания (их не считаем).
 
     :return: id найденного лота или None.
     """
@@ -439,6 +517,8 @@ def lot_is_visible(lots, title: str, price: str) -> int | None:
     except (TypeError, ValueError):
         price_f = None
     for lot in lots:
+        if exclude and int(lot.id) in exclude:
+            continue
         desc = (lot.description or "").strip()
         if probe and probe not in desc:
             continue
@@ -505,11 +585,17 @@ def init_commands(cardinal: Cardinal):
             fields["offer_id"] = "0"
             if "amount" not in values:
                 fields["amount"] = "1"
+            title = str(values.get("fields[summary][ru]") or "")
+            price = str(values.get("price") or "49")
             try:
                 time.sleep(1)
-                payload = save_offer(cardinal, fields)
-                offer_id = extract_offer_id(payload)
-                results.append(f"✅ <b>{label}</b> — создан")
+                before_ids = lot_ids(cardinal, node_id)
+                ok, offer_id, message = save_and_verify(cardinal, node_id, fields, title, price, before_ids)
+                if not ok:
+                    results.append(f"❌ <b>{label}</b>\n     {message}")
+                    logger.warning(f"[FRESH PROBE] Вариант не прошёл: {label} ({message})")
+                    continue
+                results.append(f"✅ <b>{label}</b> — создан" + (f", id {offer_id}" if offer_id else ""))
                 winner = winner or label
                 logger.info(f"[FRESH PROBE] Вариант прошёл: {label} (id={offer_id})")
                 if offer_id:
@@ -668,24 +754,16 @@ def init_commands(cardinal: Cardinal):
                     if node_id not in forms:
                         forms[node_id] = get_form(node_id)
                     fields, applied, skipped = forms[node_id].build(lot)
-                    save_offer(cardinal, fields)
-                    created += 1
-                    logger.info(f"[FRESH LOTS] Создал лот {title} в разделе {node_id}.")
+                    before_ids = lot_ids(cardinal, node_id)
+                    ok, offer_id, message = save_and_verify(cardinal, node_id, fields, title,
+                                                            fields.get("price", "0"), before_ids)
                     if skipped:
                         logger.warning(f"[FRESH LOTS] Поля, которые не перенеслись: {', '.join(skipped)}")
+                    if not ok:
+                        raise RuntimeError(message)
 
-                    # Проверяем, что лот действительно появился в разделе.
-                    try:
-                        found = lot_is_visible(my_lots(cardinal, node_id), title, fields.get("price", "0"))
-                        if found:
-                            logger.info(f"[FRESH LOTS] Лот подтверждён в разделе: id {found}.")
-                        else:
-                            unverified += 1
-                            logger.warning(f"[FRESH LOTS] FunPay ответил успехом, но лота {title} в разделе не видно.")
-                    except Exception:
-                        unverified += 1
-                        logger.warning("[FRESH LOTS] Не удалось проверить появление лота.")
-                        logger.debug("TRACEBACK", exc_info=True)
+                    created += 1
+                    logger.info(f"[FRESH LOTS] Лот создан и подтверждён: {title} (id={offer_id}).")
                 except Exception as e:
                     failed += 1
                     logger.error(f"[FRESH LOTS] Не удалось создать лот {title}.")
