@@ -30,6 +30,7 @@
 Использование (всё из Telegram, консоль на хосте не нужна):
     /fresh_check 402   → какие поля есть в форме раздела, какие обязательные,
                          какие значения у списков. Ничего не создаёт.
+    /fresh_cleanup 402 → удалить тестовые лоты, оставшиеся после /fresh_probe.
     /fresh_probe 402   → диагностика: создаёт по очереди несколько НЕАКТИВНЫХ лотов,
                          каждый со своим набором полей, и показывает, какой вариант
                          FunPay принимает. Нужен, когда непонятно, из-за какого поля
@@ -54,7 +55,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -381,6 +382,16 @@ def probe_variants() -> list[tuple[str, dict[str, str]]]:
     return variants
 
 
+PROBE_TITLES = {
+    PROBE_FILLER,
+    PROBE_TEXT["summary_ru"],
+    PROBE_TEXT["summary_en"],
+    "Volkswagen Golf GTI Racer Edition 1033 RAP БЫСТРО",
+    "Volkswagen Golf TDI Racer Edition 1033 RAP FAST",
+}
+"""Заголовки лотов, которые создаёт /fresh_probe (по ним /fresh_cleanup их и находит)."""
+
+
 def extract_offer_id(payload: dict) -> int | None:
     """Пытается достать id созданного лота из ответа FunPay."""
     for key in ("id", "offer_id", "offerId", "lotId", "lot_id"):
@@ -480,6 +491,47 @@ def init_commands(cardinal: Cardinal):
         for i in range(0, len(text), 3500):
             bot.send_message(m.chat.id, text[i:i + 3500])
 
+    def fresh_cleanup(m: Message):
+        args = (m.text or "").split()
+        node_id = args[1].strip() if len(args) > 1 else "402"
+        if not node_id.isdigit():
+            bot.send_message(m.chat.id, "Использование: <code>/fresh_cleanup 402</code>")
+            return
+        try:
+            lots = cardinal.account.get_my_subcategory_lots(int(node_id))
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось получить список лотов раздела {node_id}: <b>{e}</b>")
+            logger.debug("TRACEBACK", exc_info=True)
+            return
+
+        victims = []
+        for lot in lots:
+            title = (lot.description or "").strip()
+            if title not in PROBE_TITLES:
+                continue
+            if lot.active:
+                continue
+            if abs(float(lot.price or 0) - 49) > 0.01:
+                continue
+            victims.append(lot)
+
+        if not victims:
+            bot.send_message(m.chat.id, "🧹 Тестовых лотов не найдено — удалять нечего.")
+            return
+
+        deleted = 0
+        for lot in victims:
+            try:
+                time.sleep(1)
+                cardinal.account.delete_lot(int(lot.id))
+                deleted += 1
+                logger.info(f"[FRESH CLEANUP] Удалил тестовый лот {lot.id} ({lot.description}).")
+            except Exception:
+                logger.warning(f"[FRESH CLEANUP] Не удалось удалить лот {lot.id}.")
+                logger.debug("TRACEBACK", exc_info=True)
+
+        bot.send_message(m.chat.id, f"🧹 Нашёл тестовых лотов: <b>{len(victims)}</b>, удалил: <b>{deleted}</b>.")
+
     def act_create_lots(m: Message):
         global RUNNING
         if RUNNING:
@@ -573,11 +625,13 @@ def init_commands(cardinal: Cardinal):
         ("fresh_lots", "создает лоты по свежей форме раздела (обходит «Заполните все поля»)", True),
         ("fresh_check", "показать поля и допустимые значения раздела: /fresh_check 402", True),
         ("fresh_probe", "диагностика раздела перебором вариантов: /fresh_probe 402", True),
+        ("fresh_cleanup", "удалить тестовые лоты после диагностики: /fresh_cleanup 402", True),
     ])
 
     tg.msg_handler(act_create_lots, commands=["fresh_lots"])
     tg.msg_handler(fresh_check, commands=["fresh_check"])
     tg.msg_handler(fresh_probe, commands=["fresh_probe"])
+    tg.msg_handler(fresh_cleanup, commands=["fresh_cleanup"])
     tg.file_handler(CBT_WAIT_FILE, create_lots)
 
 
