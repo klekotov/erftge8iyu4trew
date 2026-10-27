@@ -30,6 +30,9 @@
 Использование (всё из Telegram, консоль на хосте не нужна):
     /fresh_check 402   → какие поля есть в форме раздела, какие обязательные,
                          какие значения у списков. Ничего не создаёт.
+    /fresh_raw 402     → один запрос на создание лота и ПОЛНЫЙ разбор ответа FunPay:
+                         HTTP-код, адрес, куда перенаправил, JSON или страница,
+                         текст, найденные id лотов, что было и что стало в разделе.
     /fresh_list 402    → показать ВСЕ ваши лоты раздела (включая неактивные) с id и ценой.
     /fresh_cleanup 402 → удалить тестовые лоты, оставшиеся после /fresh_probe.
     /fresh_probe 402   → диагностика: создаёт по очереди несколько НЕАКТИВНЫХ лотов,
@@ -56,7 +59,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -690,6 +693,82 @@ def init_commands(cardinal: Cardinal):
             lines.append(f"{mark} id <code>{lot.id}</code> · {lot.price:g} ₽ · {title[:70]}")
         bot.send_message(m.chat.id, "\n".join(lines))
 
+    def fresh_raw(m: Message):
+        args = (m.text or "").split()
+        node_id = args[1].strip() if len(args) > 1 else "402"
+        if not node_id.isdigit():
+            bot.send_message(m.chat.id, "Использование: <code>/fresh_raw 402</code>")
+            return
+        try:
+            form = get_form(node_id)
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось получить форму раздела {node_id}: <b>{e}</b>")
+            return
+
+        label, values = probe_variants()[1]  # наши тексты, название игры пустое
+        fields = dict(form.fields)
+        fields.update(values)
+        fields["offer_id"] = "0"
+        if "amount" not in values:
+            fields["amount"] = "1"
+
+        before = lot_ids(cardinal, node_id)
+        bot.send_message(m.chat.id, f"🧪 Отправляю ОДИН лот в раздел {node_id} (неактивный, 49 ₽) "
+                                    f"и показываю полный ответ FunPay...")
+
+        try:
+            response = cardinal.account.method("post", "lots/offerSave", SAVE_HEADERS, fields,
+                                               raise_not_200=True)
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Запрос не прошёл: <b>{e}</b>")
+            logger.debug("TRACEBACK", exc_info=True)
+            return
+
+        after = lot_ids(cardinal, node_id)
+        new_ids = sorted(after - before)
+
+        is_json = True
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                payload, is_json = {}, False
+        except Exception:
+            payload, is_json = {}, False
+
+        history = " → ".join(f"{r.status_code} {r.url}" for r in response.history) or "без редиректов"
+        found_ids = set(re.findall(r"[?&]id=(\d+)", response.text or ""))
+        found_ids |= set(re.findall(r'data-offer="(\d+)"', response.text or ""))
+        body = (response.text or "")[:600]
+
+        lines = [
+            f"🔍 <b>Ответ FunPay на создание лота в разделе {node_id}</b>",
+            "",
+            f"HTTP: <b>{response.status_code}</b>",
+            f"Адрес ответа: <code>{response.url}</code>",
+            f"Редиректы: {history}",
+            f"Content-Type: <code>{response.headers.get('content-type', '—')}</code>",
+            f"JSON: <b>{'да' if is_json else 'НЕТ, это HTML-страница'}</b>",
+        ]
+        if is_json:
+            lines.append(f"JSON: <code>{str(payload)[:400]}</code>")
+            err = parse_error(payload)
+            lines.append(f"Ошибка в JSON: <b>{err or 'нет'}</b>")
+        else:
+            lines.append(f"Текст страницы: <code>{response_text(response)[:400]}</code>")
+
+        lines += [
+            "",
+            f"Лотов в разделе было: <b>{len(before)}</b>, стало: <b>{len(after)}</b>",
+            f"Новые id: <b>{', '.join(map(str, new_ids)) or 'нет'}</b>",
+            f"id лотов, найденные в ответе: <b>{', '.join(sorted(found_ids)) or 'нет'}</b>",
+            "",
+            "Если новых id нет — лот не создан нигде. Если есть — он лежит в разделе: "
+            f"<code>/fresh_list {node_id}</code>",
+        ]
+        text = "\n".join(lines)
+        for i in range(0, len(text), 3500):
+            bot.send_message(m.chat.id, text[i:i + 3500])
+
     def act_create_lots(m: Message):
         global RUNNING
         if RUNNING:
@@ -796,6 +875,7 @@ def init_commands(cardinal: Cardinal):
         ("fresh_probe", "диагностика раздела перебором вариантов: /fresh_probe 402", True),
         ("fresh_cleanup", "удалить тестовые лоты после диагностики: /fresh_cleanup 402", True),
         ("fresh_list", "показать свои лоты раздела (включая неактивные): /fresh_list 402", True),
+        ("fresh_raw", "полный разбор ответа FunPay на создание лота: /fresh_raw 402", True),
     ])
 
     tg.msg_handler(act_create_lots, commands=["fresh_lots"])
@@ -803,6 +883,7 @@ def init_commands(cardinal: Cardinal):
     tg.msg_handler(fresh_probe, commands=["fresh_probe"])
     tg.msg_handler(fresh_cleanup, commands=["fresh_cleanup"])
     tg.msg_handler(fresh_list, commands=["fresh_list"])
+    tg.msg_handler(fresh_raw, commands=["fresh_raw"])
     tg.file_handler(CBT_WAIT_FILE, create_lots)
 
 
