@@ -305,6 +305,19 @@ def simulate_funpayapi(lot: dict) -> str | None:
     return None
 
 
+# Ограничения FunPay на длину текстов (проверено на разделе 402).
+# При превышении FunPay отвечает не «слишком длинное описание», а общей фразой
+# «Заполните все поля.», поэтому проверяем заранее.
+MAX_DESC_LEN = 500
+"""Порог предупреждения для fields[desc][ru]/[en]. Проверено на практике: 455 символов
+проходит, 1661 — нет (FunPay отвечает «Заполните все поля.»). Точный предел ищется
+командой /fresh_desc в плагине create_lots_fresh."""
+MAX_PAYMENT_MSG_LEN = 300
+"""Максимум символов в fields[payment_msg][ru]/[en]."""
+MAX_SUMMARY_LEN = 100
+"""Максимум символов в заголовке лота."""
+
+
 def validate_lot(index: int, lot: Any, meta: dict | None) -> list[tuple[str, str]]:
     """
     Проверяет один лот.
@@ -346,6 +359,19 @@ def validate_lot(index: int, lot: Any, meta: dict | None) -> list[tuple[str, str
         except (TypeError, ValueError):
             issues.append(("ERR", f"price={price!r} не число. Разделитель - точка, без пробелов: "
                                   f"199 или 199.50 (1,5 / 1 000 - не годится)"))
+
+    for field, limit, hint in (
+        ("fields[desc][ru]", MAX_DESC_LEN, "сократите описание"),
+        ("fields[desc][en]", MAX_DESC_LEN, "сократите описание"),
+        ("fields[payment_msg][ru]", MAX_PAYMENT_MSG_LEN, "сократите сообщение покупателю"),
+        ("fields[payment_msg][en]", MAX_PAYMENT_MSG_LEN, "сократите сообщение покупателю"),
+        ("fields[summary][ru]", MAX_SUMMARY_LEN, "сократите заголовок"),
+        ("fields[summary][en]", MAX_SUMMARY_LEN, "сократите заголовок"),
+    ):
+        value = lot.get(field)
+        if isinstance(value, str) and len(value) > limit:
+            issues.append(("WARN", f"{field}: {len(value)} символов, максимум ~{limit}. "
+                                   f"FunPay ответит «Заполните все поля.» — {hint}."))
 
     amount = lot.get("amount")
     if amount not in (None, ""):
