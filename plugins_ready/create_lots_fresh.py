@@ -62,7 +62,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -368,6 +368,54 @@ def save_and_verify(cardinal: Cardinal, node_id: str, fields: dict[str, str],
                          f"{response.url}). Текст со страницы: {response_text(response)}")
 
 
+def create_lot_with_fallback(cardinal: Cardinal, node_id: str, fields: dict[str, str],
+                              title: str, price: str) -> tuple[bool, int | None, str, bool, list[str]]:
+    """
+    Создает лот, перебирая варианты, если FunPay отказывает.
+
+    Порядок попыток (первая успешная — конец):
+      1. как есть (с активностью из файла);
+      2. без активации (active = "");
+      3. без активации и без поля «Название игры» (fields[name][ru]/[en]).
+
+    Отказ FunPay бывает двух видов: JSON с ошибкой (тогда save_offer возбуждает
+    RuntimeError) и HTML-страница вместо JSON (тогда save_and_verify возвращает False).
+    Обрабатываются оба.
+
+    :return: (успех, id лота, сообщение об ошибке, создан ли неактивным, лог попыток).
+    """
+    attempts: list[str] = []
+    variants: list[tuple[str, dict[str, str], bool]] = [("как в файле", dict(fields), False)]
+
+    if str(fields.get("active", "")).strip():
+        v = dict(fields); v["active"] = ""
+        variants.append(("без активации", v, True))
+
+    v = dict(fields); v["active"] = ""
+    for name in ("fields[name][ru]", "fields[name][en]"):
+        if name in v:
+            v[name] = ""
+    variants.append(("без активации и без «Название игры»", v, True))
+
+    last_message = ""
+    for label, variant_fields, is_inactive in variants:
+        before_ids = lot_ids(cardinal, node_id)
+        try:
+            ok, offer_id, message = save_and_verify(cardinal, node_id, variant_fields, title,
+                                                    variant_fields.get("price", "0"), before_ids)
+        except Exception as e:
+            ok, offer_id, message = False, None, str(e)
+
+        if ok:
+            if attempts:
+                attempts.append(f"{label} — ✅")
+            return True, offer_id, "", is_inactive, attempts
+        attempts.append(f"{label} — ❌ {message}")
+        last_message = message
+
+    return False, None, last_message, False, attempts
+
+
 def download_file(tg, msg: Message, file_name: str = "fresh_lots.json") -> bool:
     """Скачивает присланный файл в storage/cache/."""
     tg.bot.send_message(msg.chat.id, "⏬ Загружаю файл...")
@@ -506,11 +554,11 @@ def my_lots(cardinal: Cardinal, node_id: str):
         raise RuntimeError(f"не удалось получить список лотов раздела {node_id}: {e}") from e
 
 
-def find_same_title(cardinal: Cardinal, node_id: str, title: str) -> int | None:
+def find_same_title(cardinal: Cardinal, node_id: str, title: str):
     """
     Ищет в разделе лот с таким же заголовком (FunPay не любит дубли в одном разделе).
 
-    :return: id найденного лота или None.
+    :return: объект лота с таким же заголовком или None.
     """
     probe = (title or "").strip()
     if not probe:
@@ -518,10 +566,20 @@ def find_same_title(cardinal: Cardinal, node_id: str, title: str) -> int | None:
     try:
         for lot in my_lots(cardinal, node_id):
             if (lot.description or "").strip() == probe:
-                return int(lot.id)
+                return lot
     except Exception:
         logger.debug("[FRESH LOTS] Не удалось проверить дубликаты.", exc_info=True)
     return None
+
+
+def is_probe_leftover(lot) -> bool:
+    """Похож ли лот на тестовый, оставленный /fresh_probe (неактивный, 49 ₽, наш заголовок)."""
+    try:
+        return (not lot.active
+                and abs(float(lot.price or 0) - 49) <= 0.01
+                and (lot.description or "").strip() in PROBE_TITLES)
+    except Exception:
+        return False
 
 
 def lot_is_visible(lots, title: str, price: str, exclude: set[int] | None = None) -> int | None:
@@ -934,6 +992,7 @@ def init_commands(cardinal: Cardinal):
         failed = 0
         unverified = 0
         inactive = 0
+        removed_probe = 0
         try:
             if not download_file(tg, m):
                 return
@@ -972,42 +1031,38 @@ def init_commands(cardinal: Cardinal):
                         forms[node_id] = get_form(node_id)
 
                     same = find_same_title(cardinal, node_id, title)
+                    if same and is_probe_leftover(same):
+                        # Тестовый лот от /fresh_probe с тем же заголовком — удаляем,
+                        # он мешает создать настоящий.
+                        try:
+                            cardinal.account.delete_lot(int(same.id))
+                            removed_probe += 1
+                            logger.info(f"[FRESH LOTS] Удалил тестовый лот {same.id} с тем же заголовком.")
+                            same = None
+                        except Exception:
+                            logger.warning(f"[FRESH LOTS] Не удалось удалить тестовый лот {same.id}.")
                     if same and str(lot.get("active", "")).strip().lower() in ("on", "1", "true", "да"):
                         raise RuntimeError(
-                            f"в разделе уже есть лот с таким же заголовком (id <code>{same}</code>). "
-                            f"FunPay не разрешает дубли: включите его вручную в разделе или "
-                            f"измените заголовок. Подсказка: <code>/fresh_cleanup {node_id}</code> "
-                            f"удалит мои тестовые лоты"
+                            f"в разделе уже есть лот с тем же заголовком (id <code>{same.id}</code>, "
+                            f"{'активный' if same.active else 'неактивный'}). FunPay не разрешает дубли. "
+                            f"Включите/удалите его вручную или измените заголовок."
                         )
 
                     fields, applied, skipped = forms[node_id].build(lot)
-                    before_ids = lot_ids(cardinal, node_id)
-                    ok, offer_id, message = save_and_verify(cardinal, node_id, fields, title,
-                                                            fields.get("price", "0"), before_ids)
                     if skipped:
                         logger.warning(f"[FRESH LOTS] Поля, которые не перенеслись: {', '.join(skipped)}")
 
-                    # FunPay может отказать в создании СРАЗУ активного лота. Тогда создаём
-                    # неактивным (так /fresh_probe создавал лоты без проблем) и сообщаем об этом.
-                    created_inactive = False
-                    if not ok and str(fields.get("active", "")).strip():
-                        fields_inactive = dict(fields)
-                        fields_inactive["active"] = ""
-                        ok2, offer_id, message2 = save_and_verify(
-                            cardinal, node_id, fields_inactive, title,
-                            fields_inactive.get("price", "0"), lot_ids(cardinal, node_id))
-                        if ok2:
-                            ok, message, created_inactive = True, "", True
-                        else:
-                            message = f"{message}; без активации: {message2}"
+                    ok, offer_id, message, created_inactive, attempts = create_lot_with_fallback(
+                        cardinal, node_id, fields, title, fields.get("price", "0"))
 
                     if not ok:
-                        raise RuntimeError(message)
+                        raise RuntimeError("\n".join(attempts))
 
                     created += 1
                     if created_inactive:
                         inactive += 1
-                        logger.info(f"[FRESH LOTS] Лот создан НЕАКТИВНЫМ: {title} (id={offer_id}).")
+                        logger.info(f"[FRESH LOTS] Лот создан НЕАКТИВНЫМ: {title} (id={offer_id}). "
+                                    f"Попытки: {' | '.join(attempts)}")
                     else:
                         logger.info(f"[FRESH LOTS] Лот создан и подтверждён: {title} (id={offer_id}).")
                 except Exception as e:
@@ -1020,6 +1075,8 @@ def init_commands(cardinal: Cardinal):
                                      f"Ошибка: <b>{e}</b>")
 
             summary = f"✅ Готово. Создано: <b>{created}</b>, с ошибкой: <b>{failed}</b>."
+            if removed_probe:
+                summary += f"\n🧹 Удалил тестовых лотов с теми же заголовками: <b>{removed_probe}</b>."
             if inactive:
                 summary += (f"\n⚠️ Из них <b>{inactive}</b> созданы <b>неактивными</b> — FunPay не принял "
                             f"создание сразу активного лота. Включите их в разделе "
