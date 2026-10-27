@@ -33,6 +33,9 @@
     /fresh_raw 402     → один запрос на создание лота и ПОЛНЫЙ разбор ответа FunPay:
                          HTTP-код, адрес, куда перенаправил, JSON или страница,
                          текст, найденные id лотов, что было и что стало в разделе.
+    /fresh_bisect 402  → найти виноватое поле: берёт эталон, который уже срабатывал,
+                         и добавляет поля вашего лота по одному, пока не сломается.
+                         Тестовые лоты удаляются сразу после проверки.
     /fresh_list 402    → показать ВСЕ ваши лоты раздела (включая неактивные) с id и ценой.
     /fresh_activate 402→ включить (сделать активными) лоты, созданные неактивными.
     /fresh_find [слово]→ просканировать разделы (по умолчанию все, где встречается
@@ -62,7 +65,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.9.0"
+VERSION = "3.0.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -74,6 +77,7 @@ logger = getLogger("FPC.create_lots_fresh")
 RUNNING = False
 
 CBT_WAIT_FILE = "create_lots_fresh.wait_file"
+CBT_BISECT = "create_lots_fresh.bisect"
 
 SAVE_HEADERS = {
     "accept": "*/*",
@@ -610,6 +614,77 @@ def lot_is_visible(lots, title: str, price: str, exclude: set[int] | None = None
     return None
 
 
+def delete_lot_raw(cardinal: Cardinal, form_fields: dict[str, str], offer_id: int) -> bool:
+    """Удаляет лот по id (сырым запросом, без пересборки формы)."""
+    try:
+        fields = dict(form_fields)
+        fields.update({"offer_id": str(offer_id), "deleted": "1"})
+        cardinal.account.method("post", "lots/offerSave", SAVE_HEADERS, fields, raise_not_200=True)
+        return True
+    except Exception:
+        logger.warning(f"[FRESH BISECT] Не удалось удалить тестовый лот {offer_id}.")
+        logger.debug("TRACEBACK", exc_info=True)
+        return False
+
+
+def make_ladder(lot: dict, form_fields: dict[str, str]) -> list[tuple[str, dict[str, str]]]:
+    """
+    Строит «лестницу»: от эталона, который гарантированно срабатывал, к нашему лоту,
+    добавляя по одному полю.
+
+    Эталон — вариант 2 из /fresh_probe: короткие тексты, цена 49, выключенный лот.
+    Именно он создавал лоты в разделе 402.
+    """
+    base = dict(form_fields)
+    base.update({
+        "fields[name][ru]": "", "fields[name][en]": "",
+        "fields[summary][ru]": PROBE_TEXT["summary_ru"],
+        "fields[summary][en]": PROBE_TEXT["summary_en"],
+        "fields[desc][ru]": PROBE_TEXT["desc_ru"],
+        "fields[desc][en]": PROBE_TEXT["desc_en"],
+        "fields[payment_msg][ru]": PROBE_TEXT["payment_ru"],
+        "fields[payment_msg][en]": PROBE_TEXT["payment_en"],
+        "price": "49", "amount": "1", "active": "",
+    })
+    for key in ("fields[game]", "fields[type]", "fields[method]"):
+        if lot.get(key):
+            base[key] = str(lot[key])
+
+    steps: list[tuple[str, dict[str, str]]] = [
+        ("0. эталон (срабатывал в /fresh_probe)", dict(base)),
+    ]
+
+    current = dict(base)
+    order = [
+        ("1. + цена из файла", ["price"]),
+        ("2. + наш заголовок", ["fields[summary][ru]", "fields[summary][en]"]),
+        ("3. + наше описание", ["fields[desc][ru]", "fields[desc][en]"]),
+        ("4. + наше сообщение покупателю", ["fields[payment_msg][ru]", "fields[payment_msg][en]"]),
+        ("5. + «Название игры» из файла", ["fields[name][ru]", "fields[name][en]"]),
+    ]
+    for label, keys in order:
+        nxt = dict(current)
+        for key in keys:
+            if key in lot:
+                nxt[key] = str(lot[key])
+        current = nxt
+        steps.append((label, dict(current)))
+
+    # Если дело в длине текста — проверим укороченные варианты.
+    for limit in (1200, 800, 400):
+        v = dict(base)
+        v["fields[desc][ru]"] = str(lot.get("fields[desc][ru]", ""))[:limit]
+        v["fields[desc][en]"] = str(lot.get("fields[desc][en]", ""))[:limit]
+        v["fields[payment_msg][ru]"] = str(lot.get("fields[payment_msg][ru]", ""))[:limit]
+        v["fields[payment_msg][en]"] = str(lot.get("fields[payment_msg][en]", ""))[:limit]
+        v["fields[summary][ru]"] = str(lot.get("fields[summary][ru]", ""))
+        v["fields[summary][en]"] = str(lot.get("fields[summary][en]", ""))
+        v["price"] = str(lot.get("price", "49"))
+        steps.append((f"6. наши тексты, обрезанные до {limit} символов", v))
+
+    return steps
+
+
 def init_commands(cardinal: Cardinal):
     if not cardinal.telegram:
         return
@@ -964,6 +1039,93 @@ def init_commands(cardinal: Cardinal):
         bot.send_message(m.chat.id, f"🔆 Включил лотов: <b>{activated}</b> из <b>{len(inactive)}</b>. "
                                     f"Проверьте: <code>/fresh_list {node_id}</code>")
 
+    def act_bisect(m: Message):
+        result = bot.send_message(m.chat.id,
+                                  "Отправьте JSON со лотами. Возьму <b>первый</b> лот и проверю, "
+                                  "какое именно поле вызывает «Заполните все поля».\n\n"
+                                  "Каждый тестовый лот создаётся выключенным и сразу удаляется.",
+                                  reply_markup=skb.CLEAR_STATE_BTN())
+        tg.set_state(m.chat.id, result.id, m.from_user.id, CBT_BISECT)
+
+    def bisect(m: Message):
+        tg.clear_state(m.chat.id, m.from_user.id, True)
+        if not m.document or not m.document.file_name.endswith(".json"):
+            bot.send_message(m.chat.id, "❌ Это не JSON-файл.")
+            return
+        if not download_file(tg, m, "bisect_lots.json"):
+            return
+        try:
+            with open("storage/cache/bisect_lots.json", "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось прочитать файл: <b>{e}</b>")
+            return
+
+        if isinstance(data, dict):
+            data = [data]
+        lot = next((x for x in data if isinstance(x, dict)), None)
+        if not lot:
+            bot.send_message(m.chat.id, "❌ В файле нет лотов.")
+            return
+
+        node_id = str(lot.get("node_id") or "402").strip()
+        if not node_id.isdigit():
+            bot.send_message(m.chat.id, "❌ Не указан node_id.")
+            return
+
+        try:
+            form = get_form(node_id)
+        except Exception as e:
+            bot.send_message(m.chat.id, f"❌ Не удалось получить форму раздела {node_id}: <b>{e}</b>")
+            return
+
+        steps = make_ladder(lot, form.fields)
+        title = str(lot.get("fields[summary][ru]") or "тест")
+        bot.send_message(m.chat.id,
+                         f"🔬 Проверяю {len(steps)} вариантов на лоте <code>{title[:40]}</code>.\n"
+                         f"Каждый тестовый лот удаляется сразу. ~{len(steps) * 3} секунд...")
+
+        results: list[str] = []
+        first_bad: str | None = None
+        for label, fields in steps:
+            fields = dict(fields)
+            fields["offer_id"] = "0"
+            price = str(fields.get("price") or "49")
+            step_title = str(fields.get("fields[summary][ru]") or "")
+            before = lot_ids(cardinal, node_id)
+            time.sleep(1)
+            try:
+                ok, offer_id, message = save_and_verify(cardinal, node_id, fields, step_title,
+                                                        price, before)
+            except Exception as e:
+                ok, offer_id, message = False, None, str(e)
+
+            if ok:
+                results.append(f"✅ {label}")
+                if offer_id:
+                    time.sleep(0.5)
+                    delete_lot_raw(cardinal, form.fields, offer_id)
+                else:
+                    new_ids = sorted(lot_ids(cardinal, node_id) - before)
+                    for new_id in new_ids:
+                        delete_lot_raw(cardinal, form.fields, new_id)
+            else:
+                results.append(f"❌ <b>{label}</b>\n     {message}")
+                if first_bad is None:
+                    first_bad = label
+                    break  # дальше идти нет смысла: ломается уже это поле
+
+        text = ("🔬 <b>Где ломается</b>\n\n" + "\n".join(results))
+        if first_bad and first_bad.startswith("0"):
+            text += "\n\n😕 Не сработал даже эталон — значит изменилось на стороне FunPay (лимит/модерация)."
+        elif first_bad:
+            text += (f"\n\n🎯 Виновато: <b>{first_bad}</b> — всё, что до него, создаётся. "
+                     f"Пришлите этот экран, поправлю файл или плагин под это.")
+        else:
+            text += "\n\n🎉 Все варианты создались — пришлите экран, разберёмся, что поменялось."
+        for i in range(0, len(text), 3500):
+            bot.send_message(m.chat.id, text[i:i + 3500])
+
     def act_create_lots(m: Message):
         global RUNNING
         if RUNNING:
@@ -1104,6 +1266,7 @@ def init_commands(cardinal: Cardinal):
         ("fresh_probe", "диагностика раздела перебором вариантов: /fresh_probe 402", True),
         ("fresh_cleanup", "удалить тестовые лоты после диагностики: /fresh_cleanup 402", True),
         ("fresh_list", "показать свои лоты раздела (включая неактивные): /fresh_list 402", True),
+        ("fresh_bisect", "найти виноватое поле: /fresh_bisect 402", True),
         ("fresh_raw", "полный разбор ответа FunPay на создание лота: /fresh_raw 402", True),
         ("fresh_find", "найти, в каких разделах у вас вообще есть лоты: /fresh_find", True),
         ("fresh_activate", "включить неактивные лоты раздела: /fresh_activate 402", True),
@@ -1114,6 +1277,8 @@ def init_commands(cardinal: Cardinal):
     tg.msg_handler(fresh_probe, commands=["fresh_probe"])
     tg.msg_handler(fresh_cleanup, commands=["fresh_cleanup"])
     tg.msg_handler(fresh_list, commands=["fresh_list"])
+    tg.msg_handler(act_bisect, commands=["fresh_bisect"])
+    tg.file_handler(CBT_BISECT, bisect)
     tg.msg_handler(fresh_raw, commands=["fresh_raw"])
     tg.msg_handler(fresh_find, commands=["fresh_find"])
     tg.msg_handler(fresh_activate, commands=["fresh_activate"])
