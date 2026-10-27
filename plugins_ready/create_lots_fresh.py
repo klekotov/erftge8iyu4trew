@@ -30,6 +30,7 @@
 Использование (всё из Telegram, консоль на хосте не нужна):
     /fresh_check 402   → какие поля есть в форме раздела, какие обязательные,
                          какие значения у списков. Ничего не создаёт.
+    /fresh_list 402    → показать ВСЕ ваши лоты раздела (включая неактивные) с id и ценой.
     /fresh_cleanup 402 → удалить тестовые лоты, оставшиеся после /fresh_probe.
     /fresh_probe 402   → диагностика: создаёт по очереди несколько НЕАКТИВНЫХ лотов,
                          каждый со своим набором полей, и показывает, какой вариант
@@ -55,7 +56,7 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
                "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
@@ -405,6 +406,48 @@ def extract_offer_id(payload: dict) -> int | None:
     return None
 
 
+def my_lots(cardinal: Cardinal, node_id: str):
+    """
+    Возвращает список своих лотов в разделе.
+
+    :param cardinal: объект кардинала.
+    :param node_id: id раздела.
+
+    :return: список MyLotShortcut.
+
+    :raises RuntimeError: если список получить не удалось.
+    """
+    try:
+        return cardinal.account.get_my_subcategory_lots(int(node_id))
+    except Exception as e:
+        raise RuntimeError(f"не удалось получить список лотов раздела {node_id}: {e}") from e
+
+
+def lot_is_visible(lots, title: str, price: str) -> int | None:
+    """
+    Ищет созданный лот в списке своих лотов раздела.
+
+    :param lots: список лотов раздела.
+    :param title: заголовок лота.
+    :param price: цена лота (строкой).
+
+    :return: id найденного лота или None.
+    """
+    probe = (title or "").strip()[:25]
+    try:
+        price_f = float(str(price).replace(",", "."))
+    except (TypeError, ValueError):
+        price_f = None
+    for lot in lots:
+        desc = (lot.description or "").strip()
+        if probe and probe not in desc:
+            continue
+        if price_f is not None and abs(float(lot.price or 0) - price_f) > 0.01:
+            continue
+        return int(lot.id)
+    return None
+
+
 def init_commands(cardinal: Cardinal):
     if not cardinal.telegram:
         return
@@ -532,6 +575,35 @@ def init_commands(cardinal: Cardinal):
 
         bot.send_message(m.chat.id, f"🧹 Нашёл тестовых лотов: <b>{len(victims)}</b>, удалил: <b>{deleted}</b>.")
 
+    def fresh_list(m: Message):
+        args = (m.text or "").split()
+        node_id = args[1].strip() if len(args) > 1 else "402"
+        if not node_id.isdigit():
+            bot.send_message(m.chat.id, "Использование: <code>/fresh_list 402</code>")
+            return
+        try:
+            lots = my_lots(cardinal, node_id)
+        except RuntimeError as e:
+            bot.send_message(m.chat.id, f"❌ {e}")
+            logger.debug("TRACEBACK", exc_info=True)
+            return
+
+        if not lots:
+            bot.send_message(m.chat.id,
+                             f"В разделе <a href=\"https://funpay.com/lots/{node_id}/trade\">{node_id}</a> "
+                             f"у вас нет ни одного лота — ни активного, ни неактивного.")
+            return
+
+        active = [l for l in lots if l.active]
+        lines = [f"Лоты в разделе <a href=\"https://funpay.com/lots/{node_id}/trade\">{node_id}</a>: "
+                 f"всего <b>{len(lots)}</b>, активных <b>{len(active)}</b>, "
+                 f"неактивных <b>{len(lots) - len(active)}</b>", ""]
+        for lot in lots[:60]:
+            mark = "🟢" if lot.active else "⚪"
+            title = (lot.description or "без описания").strip()
+            lines.append(f"{mark} id <code>{lot.id}</code> · {lot.price:g} ₽ · {title[:70]}")
+        bot.send_message(m.chat.id, "\n".join(lines))
+
     def act_create_lots(m: Message):
         global RUNNING
         if RUNNING:
@@ -558,6 +630,7 @@ def init_commands(cardinal: Cardinal):
         RUNNING = True
         created = 0
         failed = 0
+        unverified = 0
         try:
             if not download_file(tg, m):
                 return
@@ -599,7 +672,20 @@ def init_commands(cardinal: Cardinal):
                     created += 1
                     logger.info(f"[FRESH LOTS] Создал лот {title} в разделе {node_id}.")
                     if skipped:
-                        logger.warning(f"[FRESH LOTS] В форме раздела {node_id} нет полей: {', '.join(skipped)}")
+                        logger.warning(f"[FRESH LOTS] Поля, которые не перенеслись: {', '.join(skipped)}")
+
+                    # Проверяем, что лот действительно появился в разделе.
+                    try:
+                        found = lot_is_visible(my_lots(cardinal, node_id), title, fields.get("price", "0"))
+                        if found:
+                            logger.info(f"[FRESH LOTS] Лот подтверждён в разделе: id {found}.")
+                        else:
+                            unverified += 1
+                            logger.warning(f"[FRESH LOTS] FunPay ответил успехом, но лота {title} в разделе не видно.")
+                    except Exception:
+                        unverified += 1
+                        logger.warning("[FRESH LOTS] Не удалось проверить появление лота.")
+                        logger.debug("TRACEBACK", exc_info=True)
                 except Exception as e:
                     failed += 1
                     logger.error(f"[FRESH LOTS] Не удалось создать лот {title}.")
@@ -609,11 +695,16 @@ def init_commands(cardinal: Cardinal):
                                      f"Раздел: <a href=\"https://funpay.com/lots/{node_id}/trade\">{node_id}</a>\n"
                                      f"Ошибка: <b>{e}</b>")
 
+            summary = f"✅ Готово. Создано: <b>{created}</b>, с ошибкой: <b>{failed}</b>."
+            if unverified:
+                summary += (f"\n⚠️ Не удалось подтвердить в разделе: <b>{unverified}</b> "
+                            f"(FunPay ответил успехом, но лота не видно). Проверьте: "
+                            f"<code>/fresh_list 402</code>")
             hint = ""
             if failed:
                 hint = ("\n\nПодсказка: <code>/fresh_check &lt;node_id&gt;</code> покажет поля раздела "
                         "и допустимые значения списков.")
-            bot.send_message(m.chat.id, f"✅ Готово. Создано: <b>{created}</b>, с ошибкой: <b>{failed}</b>." + hint)
+            bot.send_message(m.chat.id, summary + hint)
         except Exception:
             logger.error("[FRESH LOTS] Не удалось выполнить создание лотов.")
             logger.debug("TRACEBACK", exc_info=True)
@@ -626,12 +717,14 @@ def init_commands(cardinal: Cardinal):
         ("fresh_check", "показать поля и допустимые значения раздела: /fresh_check 402", True),
         ("fresh_probe", "диагностика раздела перебором вариантов: /fresh_probe 402", True),
         ("fresh_cleanup", "удалить тестовые лоты после диагностики: /fresh_cleanup 402", True),
+        ("fresh_list", "показать свои лоты раздела (включая неактивные): /fresh_list 402", True),
     ])
 
     tg.msg_handler(act_create_lots, commands=["fresh_lots"])
     tg.msg_handler(fresh_check, commands=["fresh_check"])
     tg.msg_handler(fresh_probe, commands=["fresh_probe"])
     tg.msg_handler(fresh_cleanup, commands=["fresh_cleanup"])
+    tg.msg_handler(fresh_list, commands=["fresh_list"])
     tg.file_handler(CBT_WAIT_FILE, create_lots)
 
 
