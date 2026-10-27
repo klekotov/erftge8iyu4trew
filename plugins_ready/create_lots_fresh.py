@@ -1,36 +1,36 @@
 """
-Плагин для FunPay Cardinal: создание лотов по JSON «как сайт».
+Плагин для FunPay Cardinal: создание лотов по «живой» форме раздела.
 
 Зачем нужен:
-    Штатный плагин Lots Copy (/create_lots) берёт JSON и прогоняет его через
-    FunPayAPI.types.LotFields.renew_fields(). Тот принудительно:
-      * добавляет "fields[images]" (пустым),
-      * переводит цену в float ("49" -> "49.0"),
-      * подставляет свой набор ключей.
-    В разделах вроде 402 («Прочие игры Roblox» с полями game/type/method) из-за этого
-    FunPay отвечает: «Заполните все поля.» и лот не создаётся.
+    Штатный плагин Lots Copy (/create_lots) берёт ваш JSON и отдаёт его
+    FunPayAPI.types.LotFields.renew_fields(). Тот перед отправкой пересобирает форму
+    «по-своему»:
+      * добавляет "fields[images]" (пустым), даже если в форме раздела такого поля нет;
+      * делает цену числом и отправляет "49.0" вместо "49";
+      * всегда отправляет поля из файла, даже если в форме раздела их нет;
+      * берёт form_created_at из файла (он может быть днями давности), а не свежий.
 
-    Этот плагин делает иначе и ровно так, как это делает сам сайт:
+    А форма лота у каждого раздела своя: например, в разделе 1089 (Battle.net) в лоте
+    есть поле "query", в разделе 402 (прочие игры) — поля game / type / method.
+    Поэтому «универсальный» набор ключей то работает, то нет.
+
+    Этот плагин работает как сам сайт:
       1. GET lots/offerEdit?node=<node_id> — забирает СВЕЖУЮ форму раздела
-         (все input/select/textarea, включая скрытые, и актуальные csrf_token /
-         form_created_at);
-      2. подменяет в этой форме только то, что нужно: тексты, цену, наличие, флаги
-         и поля раздела из вашего JSON;
-      3. POST lots/offerSave — отправляет форму как есть, без пересборки.
-
-    Если FunPay всё же откажет, плагин покажет ТОЧНЫЙ текст ошибки от FunPay.
+         (все input/select/textarea, включая скрытые, свежие csrf_token и form_created_at);
+      2. подставляет в неё значения ТОЛЬКО тех полей, которые в этой форме есть;
+         для выпадающих списков значение подбирается по подписи варианта
+         (например "Car Dealership Tycoon" -> нужный value списка);
+      3. POST lots/offerSave — отправляет форму как есть, без пересборки;
+      4. если FunPay откажет — показывает дословный текст ошибки FunPay.
 
 Установка:
     1. Меню бота → Плагины → ➕ Добавить плагин → отправить этот файл (.py).
     2. /restart — чтобы плагин загрузился.
 
-Использование:
-    /fresh_check 402  → показать, какие поля есть в форме раздела и какие обязательны
-                        (без запуска чего-либо на хосте — всё из Telegram).
-
-    /fresh_lots  → бот ждёт JSON-файл (список лотов, формат как у /create_lots).
-
-    Каждый лот создаётся ~1 шт/сек. В конце — отчёт: сколько создано, где ошибки.
+Использование (всё из Telegram, консоль на хосте не нужна):
+    /fresh_check 402   → какие поля есть в форме раздела, какие обязательные,
+                         какие значения у списков. Ничего не создаёт.
+    /fresh_lots        → бот ждёт JSON-файл со лотами (формат как у /create_lots).
 """
 
 from __future__ import annotations
@@ -49,8 +49,9 @@ from telebot.types import Message
 from tg_bot import static_keyboards as skb
 
 NAME = "Create Lots Fresh"
-VERSION = "1.0.0"
-DESCRIPTION = ("Создает лоты из JSON, используя свежую форму раздела (без пересборки полей). "
+VERSION = "2.0.0"
+DESCRIPTION = ("Создает лоты из JSON по свежей форме раздела: отправляет только те поля, "
+               "которые есть в форме, и подбирает значения списков. "
                "Решает ошибку «Заполните все поля» в разделах с доп. полями.")
 CREDITS = "для FunPay Cardinal"
 UUID = "b7f3c1a2-6f4d-4e2b-9a11-7d5c0e8f4b31"
@@ -67,117 +68,171 @@ SAVE_HEADERS = {
     "x-requested-with": "XMLHttpRequest",
 }
 
+# Поля, которые всегда берутся из свежей формы, а не из файла:
+# это скрытые служебные поля, их нельзя переиспользовать из старого /cache_lots.
+SERVER_FIELDS = {"csrf_token", "offer_id", "node_id", "form_created_at", "location", "deleted", "query"}
 
-def parse_offer_form(html: str) -> dict[str, str]:
-    """
-    Разбирает форму /lots/offerEdit ровно так же, как это делает FunPayAPI,
-    но без дополнительных запросов и без приведения типов.
 
-    :param html: HTML страницы создания/редактирования лота.
+class OfferForm:
+    """Разобранная форма создания лота раздела."""
 
-    :return: словарь со всеми полями формы.
+    def __init__(self, html: str):
+        bs = BeautifulSoup(html, "lxml")
 
-    :raises RuntimeError: если FunPay вернул ошибку или формы нет на странице.
-    """
-    bs = BeautifulSoup(html, "lxml")
+        error = bs.find("p", class_="lead")
+        if error is not None:
+            raise RuntimeError(f"FunPay: {error.text.strip()}")
 
-    error = bs.find("p", class_="lead")
-    if error is not None:
-        raise RuntimeError(f"FunPay: {error.text.strip()}")
+        form = bs.find("form", class_="form-offer-editor")
+        if form is None:
+            raise RuntimeError("на странице нет формы лота (неверный node_id или раздел недоступен)")
 
-    form = bs.find("form", class_="form-offer-editor")
-    if form is None:
-        raise RuntimeError("на странице нет формы лота (нет доступа к разделу или неверный node_id)")
+        self.fields: dict[str, str] = {}
+        self.options: dict[str, list[tuple[str, str]]] = {}
+        self.required: set[str] = set()
+        self.labels: dict[str, str] = {}
+        self.hidden: list[str] = []
 
-    fields: dict[str, str] = {}
+        for group in form.find_all("div", class_="form-group"):
+            label = group.find("label")
+            control = group.find(["input", "select", "textarea"])
+            if not label or not control or not control.get("name"):
+                continue
+            self.labels[control["name"]] = label.get_text(strip=True).rstrip("*").strip()
+            if ("required" in group.get("class", [])
+                    or bool(control.get("required"))
+                    or bool(label.find("span", class_="text-danger"))):
+                self.required.add(control["name"])
 
-    for inp in form.find_all("input"):
-        name = inp.get("name")
-        if name:
-            fields[name] = inp.get("value") or ""
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            self.fields[name] = inp.get("value") or ""
+            if inp.get("type") == "hidden":
+                self.hidden.append(name)
 
-    for ta in form.find_all("textarea"):
-        name = ta.get("name")
-        if name:
-            fields[name] = ta.text or ""
+        for ta in form.find_all("textarea"):
+            name = ta.get("name")
+            if name:
+                self.fields[name] = ta.text or ""
 
-    for sel in form.find_all("select"):
-        name = sel.get("name")
-        if not name:
-            continue
-        parent = sel.find_parent(class_="form-group")
-        if parent and "hidden" in parent.get("class", []):
-            continue
-        option = sel.find("option", selected=True) or sel.find("option")
-        fields[name] = option.get("value", "") if option is not None else ""
+        for sel in form.find_all("select"):
+            name = sel.get("name")
+            if not name:
+                continue
+            parent = sel.find_parent(class_="form-group")
+            if parent and "hidden" in parent.get("class", []):
+                continue
+            opts = [(o.get("value", ""), o.get_text(strip=True)) for o in sel.find_all("option")]
+            self.options[name] = opts
+            current = sel.find("option", selected=True) or (sel.find("option") if opts else None)
+            self.fields[name] = current.get("value", "") if current is not None else ""
 
-    for cb in form.find_all("input", {"type": "checkbox"}, checked=True):
-        if cb.get("name"):
-            fields[cb["name"]] = "on"
+        for cb in form.find_all("input", {"type": "checkbox"}):
+            name = cb.get("name")
+            if not name:
+                continue
+            self.fields[name] = "on" if cb.has_attr("checked") else ""
 
-    return fields
+        self.checked = {n for n, v in self.fields.items() if v == "on"}
+
+    def resolve_select(self, name: str, value: str) -> str:
+        """
+        Подбирает value выпадающего списка по значению или подписи варианта.
+
+        :param name: имя поля.
+        :param value: желаемое значение из JSON.
+
+        :raises RuntimeError: если варианта с таким значением нет.
+        """
+        value = str(value).strip()
+        opts = self.options[name]
+        if value in {v for v, _ in opts}:
+            return value
+        lowered = value.casefold()
+        for v, text in opts:
+            if text.strip().casefold() == lowered:
+                return v
+        for v, text in opts:
+            if lowered and lowered in text.strip().casefold():
+                return v
+        variants = ", ".join(f"{v or '—'} = {t}" for v, t in opts[:30])
+        raise RuntimeError(f"поле «{self.labels.get(name, name)}»: значения {value!r} нет в списке. "
+                           f"Доступно: {variants}")
+
+    def describe(self) -> list[str]:
+        """Возвращает человекочитаемое описание формы для Telegram."""
+        lines = ["🔴 — обязательное, ⚪ — необязательное", ""]
+        for name, value in self.fields.items():
+            if name in self.hidden:
+                continue
+            mark = "🔴" if name in self.required else "⚪"
+            label = self.labels.get(name, "")
+            if name in self.options:
+                opts = ", ".join(f"{v or '—'} = {t}" for v, t in self.options[name][:30])
+                lines.append(f"{mark} <code>{name}</code> — {label}\n     варианты: {opts}")
+            else:
+                shown = f"{value!r}" if len(value) <= 40 else f"{len(value)} символов"
+                lines.append(f"{mark} <code>{name}</code> — {label} (сейчас: {shown})")
+        lines.append("")
+        lines.append("🫥 скрытые (берутся из свежей формы): " + ", ".join(self.hidden))
+        return lines
+
+    def build(self, lot: dict) -> tuple[dict[str, str], list[str], list[str]]:
+        """
+        Собирает поля для отправки: свежая форма + значения из JSON.
+
+        :param lot: лот из JSON-файла.
+
+        :return: (поля для отправки, применённые ключи, пропущенные ключи).
+        """
+        fields = dict(self.fields)
+        applied: list[str] = []
+        skipped: list[str] = []
+
+        for key, value in lot.items():
+            value = "" if value is None else str(value)
+            if key in SERVER_FIELDS:
+                continue
+            if key not in fields:
+                skipped.append(key)
+                continue
+            if key in self.hidden:
+                # Скрытые поля (fields[name], fields[images] и т.п.) сайт отправляет ровно
+                # теми, что выдал сервер: пользователь их не заполняет. Значения из старого
+                # /cache_lots здесь только мешают.
+                skipped.append(f"{key} (скрытое, оставил из формы)")
+                continue
+            if key in self.options:
+                try:
+                    fields[key] = self.resolve_select(key, value) if value else ""
+                except RuntimeError:
+                    raise
+            elif key in ("active", "auto_delivery", "deactivate_after_sale"):
+                fields[key] = "on" if value.strip().casefold() in ("on", "1", "true", "да") else ""
+            else:
+                fields[key] = value
+            applied.append(key)
+
+        # Активность: включённый по умолчанию чекбокс не должен «теряться»,
+        # если в JSON его вовсе не было.
+        if "active" not in lot and "active" in fields:
+            fields["active"] = "on"
+
+        for name in self.required:
+            if name in SERVER_FIELDS:
+                continue
+            if not str(fields.get(name, "")).strip():
+                raise RuntimeError(f"не заполнено обязательное поле «{self.labels.get(name, name)}» ({name})")
+
+        fields["offer_id"] = "0"
+        return fields, applied, skipped
 
 
 def describe_form(html: str) -> list[str]:
-    """
-    Возвращает человекочитаемое описание полей формы раздела: имя, обязательность,
-    подпись и допустимые значения для select.
-
-    :param html: HTML формы /lots/offerEdit.
-
-    :return: список строк для отправки в Telegram.
-    """
-    bs = BeautifulSoup(html, "lxml")
-    form = bs.find("form", class_="form-offer-editor")
-    if form is None:
-        raise RuntimeError("на странице нет формы лота (нет доступа к разделу или неверный node_id)")
-
-    lines: list[str] = []
-    labels: dict[str, tuple[str, bool]] = {}
-    for group in form.find_all("div", class_="form-group"):
-        label = group.find("label")
-        control = group.find(["input", "select", "textarea"])
-        if not label or not control or not control.get("name"):
-            continue
-        required = ("required" in group.get("class", [])
-                    or bool(control.get("required"))
-                    or bool(label.find("span", class_="text-danger")))
-        labels[control["name"]] = (label.get_text(strip=True).rstrip("*").strip(), required)
-
-    for sel in form.find_all("select"):
-        name = sel.get("name")
-        if not name:
-            continue
-        parent = sel.find_parent(class_="form-group")
-        if parent and "hidden" in parent.get("class", []):
-            continue
-        label, required = labels.get(name, ("", False))
-        options = [(o.get("value", ""), o.get_text(strip=True)) for o in sel.find_all("option")]
-        current = sel.find("option", selected=True)
-        lines.append(f"{'🔴' if required else '⚪'} <code>{name}</code> — {label}")
-        lines.append(f"     сейчас: {current.get('value', '') if current else ''!r}")
-        lines.append("     значения: " + ", ".join(f"{v} = {t}" for v, t in options[:25]))
-
-    for inp in form.find_all("input"):
-        name = inp.get("name")
-        if not name or inp.get("type") == "hidden":
-            continue
-        label, required = labels.get(name, ("", False))
-        if name.startswith("fields[") or name in ("price", "amount"):
-            lines.append(f"{'🔴' if required else '⚪'} <code>{name}</code> — {label} "
-                         f"(сейчас: {inp.get('value') or ''!r})")
-
-    for ta in form.find_all("textarea"):
-        name = ta.get("name")
-        if not name:
-            continue
-        label, required = labels.get(name, ("", False))
-        lines.append(f"{'🔴' if required else '⚪'} <code>{name}</code> — {label} "
-                     f"(сейчас: {len(ta.text or '')} символов)")
-
-    hidden = [inp["name"] for inp in form.find_all("input", {"type": "hidden"}) if inp.get("name")]
-    lines.append("\n🫥 скрытые поля (их плагин отправляет как есть): " + ", ".join(hidden))
-    return lines
+    """Совместимость: описание формы."""
+    return OfferForm(html).describe()
 
 
 def save_offer(cardinal: Cardinal, fields: dict[str, str]) -> dict:
@@ -214,9 +269,7 @@ def save_offer(cardinal: Cardinal, fields: dict[str, str]) -> dict:
 
 
 def download_file(tg, msg: Message, file_name: str = "fresh_lots.json") -> bool:
-    """
-    Скачивает присланный файл в storage/cache/.
-    """
+    """Скачивает присланный файл в storage/cache/."""
     tg.bot.send_message(msg.chat.id, "⏬ Загружаю файл...")
     try:
         file_info = tg.bot.get_file(msg.document.file_id)
@@ -237,30 +290,11 @@ def init_commands(cardinal: Cardinal):
     tg = cardinal.telegram
     bot = tg.bot
 
-    def create_lot_fresh(lot: dict, node_id: str) -> dict:
-        """
-        Создает один лот: свежая форма раздела + подстановка значений из JSON.
-        """
+    def get_form(node_id: str) -> OfferForm:
+        """Забирает и разбирает свежую форму создания лота раздела."""
         response = cardinal.account.method("get", f"lots/offerEdit?node={node_id}", {}, {},
                                            raise_not_200=True)
-        fields = parse_offer_form(response.content.decode())
-
-        for key, value in lot.items():
-            if key in ("csrf_token", "offer_id"):
-                continue
-            fields[key] = value
-
-        # Активность: плагин умеет только два состояния.
-        fields["active"] = "on" if str(lot.get("active", "")).strip() == "on" else ""
-
-        # Наличие: пустая строка = не отправляем значение, FunPay посчитает сам.
-        amount = lot.get("amount")
-        if amount in (None, ""):
-            fields.pop("amount", None)
-        else:
-            fields["amount"] = str(amount)
-
-        return save_offer(cardinal, fields)
+        return OfferForm(response.content.decode())
 
     def fresh_check(m: Message):
         args = (m.text or "").split()
@@ -269,16 +303,14 @@ def init_commands(cardinal: Cardinal):
             bot.send_message(m.chat.id, "Использование: <code>/fresh_check 402</code>")
             return
         try:
-            response = cardinal.account.method("get", f"lots/offerEdit?node={node_id}", {}, {},
-                                               raise_not_200=True)
-            lines = describe_form(response.content.decode())
+            form = get_form(node_id)
         except Exception as e:
             bot.send_message(m.chat.id, f"❌ Не удалось получить форму раздела {node_id}: <b>{e}</b>")
             logger.debug("TRACEBACK", exc_info=True)
             return
 
-        text = (f"Форма раздела <a href=\"https://funpay.com/lots/{node_id}/trade\">{node_id}</a>\n"
-                f"🔴 — обязательное, ⚪ — необязательное\n\n" + "\n".join(lines))
+        text = (f"Форма раздела <a href=\"https://funpay.com/lots/{node_id}/trade\">{node_id}</a>\n\n"
+                + "\n".join(form.describe()))
         for i in range(0, len(text), 3500):
             bot.send_message(m.chat.id, text[i:i + 3500])
 
@@ -289,8 +321,8 @@ def init_commands(cardinal: Cardinal):
             return
         result = bot.send_message(m.chat.id,
                                   "Отправьте JSON-файл со лотами (формат как у /create_lots).\n"
-                                  "Плагин возьмёт свежую форму каждого раздела и подставит значения "
-                                  "из файла — так же, как это делает сайт.",
+                                  "Плагин возьмёт свежую форму каждого раздела и подставит в неё "
+                                  "только те поля, которые в этой форме есть.",
                                   reply_markup=skb.CLEAR_STATE_BTN())
         tg.set_state(m.chat.id, result.id, m.from_user.id, CBT_WAIT_FILE)
 
@@ -310,7 +342,6 @@ def init_commands(cardinal: Cardinal):
         failed = 0
         try:
             if not download_file(tg, m):
-                RUNNING = False
                 return
 
             with open("storage/cache/fresh_lots.json", "r", encoding="utf-8") as f:
@@ -320,11 +351,12 @@ def init_commands(cardinal: Cardinal):
                 data = [data]
             if not isinstance(data, list) or not data:
                 bot.send_message(m.chat.id, "❌ В файле должен быть непустой список лотов.")
-                RUNNING = False
                 return
 
             bot.send_message(m.chat.id, f"Получено {len(data)} лот(-а/-ов).\n"
                                         f"Создаю по свежей форме раздела (1 лот/сек)...")
+
+            forms: dict[str, OfferForm] = {}
 
             for index, lot in enumerate(data, start=1):
                 if not isinstance(lot, dict):
@@ -342,9 +374,14 @@ def init_commands(cardinal: Cardinal):
 
                 try:
                     time.sleep(1)
-                    create_lot_fresh(lot, node_id)
+                    if node_id not in forms:
+                        forms[node_id] = get_form(node_id)
+                    fields, applied, skipped = forms[node_id].build(lot)
+                    save_offer(cardinal, fields)
                     created += 1
                     logger.info(f"[FRESH LOTS] Создал лот {title} в разделе {node_id}.")
+                    if skipped:
+                        logger.warning(f"[FRESH LOTS] В форме раздела {node_id} нет полей: {', '.join(skipped)}")
                 except Exception as e:
                     failed += 1
                     logger.error(f"[FRESH LOTS] Не удалось создать лот {title}.")
@@ -352,9 +389,13 @@ def init_commands(cardinal: Cardinal):
                     bot.send_message(m.chat.id,
                                      f"❌ [{index}] <code>{title}</code>\n"
                                      f"Раздел: <a href=\"https://funpay.com/lots/{node_id}/trade\">{node_id}</a>\n"
-                                     f"Ошибка FunPay: <b>{e}</b>")
+                                     f"Ошибка: <b>{e}</b>")
 
-            bot.send_message(m.chat.id, f"✅ Готово. Создано: <b>{created}</b>, с ошибкой: <b>{failed}</b>.")
+            hint = ""
+            if failed:
+                hint = ("\n\nПодсказка: <code>/fresh_check &lt;node_id&gt;</code> покажет поля раздела "
+                        "и допустимые значения списков.")
+            bot.send_message(m.chat.id, f"✅ Готово. Создано: <b>{created}</b>, с ошибкой: <b>{failed}</b>." + hint)
         except Exception:
             logger.error("[FRESH LOTS] Не удалось выполнить создание лотов.")
             logger.debug("TRACEBACK", exc_info=True)
@@ -364,7 +405,7 @@ def init_commands(cardinal: Cardinal):
 
     cardinal.add_telegram_commands(UUID, [
         ("fresh_lots", "создает лоты по свежей форме раздела (обходит «Заполните все поля»)", True),
-        ("fresh_check", "показать поля и обязательность полей раздела: /fresh_check 402", True),
+        ("fresh_check", "показать поля и допустимые значения раздела: /fresh_check 402", True),
     ])
 
     tg.msg_handler(act_create_lots, commands=["fresh_lots"])
